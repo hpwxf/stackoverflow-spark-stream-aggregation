@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Docs
+ * https://www.digitalocean.com/community/tutorials/log4j2-example-tutorial-configuration-levels-appenders
+ * https://logging.apache.org/log4j/2.x/manual/configuration.html
+-->
+<Configuration>
+    <Appenders>
+        <Console name="Console">
+            <!-- https://logging.apache.org/log4j/2.x/manual/layouts.html#PatternLayout -->
+            <PatternLayout pattern="%highlight{[%-5level] %d [%t] %c{1}:%L - %msg%n%throwable}"/>
+        </Console>
+    </Appenders>
+    <Loggers>
+        <Root level="WARN">
+            <AppenderRef ref="Console"/>
+        </Root>
+        <logger name="com.nuant" level="TRACE" additivity="false">
+            <AppenderRef ref="Console"/>
+        </logger>
+    </Loggers>
+</Configuration>

@@ -1,0 +1,1 @@
+Reproducer for complete stream aggregation
