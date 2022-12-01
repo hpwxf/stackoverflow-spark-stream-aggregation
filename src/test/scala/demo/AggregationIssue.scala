@@ -3,7 +3,7 @@ package demo
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{SparkSession, functions}
+import org.apache.spark.sql.{SQLContext, SparkSession, functions}
 import org.scalatest.flatspec.AnyFlatSpec
 
 import java.time.{Duration, Instant}
@@ -18,8 +18,8 @@ class AggregationIssue extends AnyFlatSpec {
 
   import spark.implicits._
 
-  val columns = Seq("timestamp", "group", "value")
-  val data = List(
+  private val columns = Seq("timestamp", "group", "value")
+  private val data = List(
     (Instant.parse("2020-01-01T00:00:00Z"), "Group1", 0),
     (Instant.parse("2020-01-01T00:00:00Z"), "Group2", 0),
     (Instant.parse("2020-01-01T12:00:00Z"), "Group1", 1),
@@ -98,7 +98,7 @@ class AggregationIssue extends AnyFlatSpec {
 
   "memory stream test" should "be ok" in {
 
-    implicit val sqlCtx = spark.sqlContext
+    implicit val sqlCtx: SQLContext = spark.sqlContext
     val memoryStream = MemoryStream[(Instant, String, Int)]
     // memoryStream.addData(Seq.range(0, 11).map(generateRow))
     memoryStream.addData(data)
