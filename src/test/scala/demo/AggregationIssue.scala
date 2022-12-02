@@ -3,7 +3,7 @@ package demo
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.{SQLContext, SparkSession, functions}
+import org.apache.spark.sql.{Dataset, ForeachWriter, Row, SQLContext, SparkSession, functions}
 import org.scalatest.flatspec.AnyFlatSpec
 
 import java.time.{Duration, Instant}
@@ -60,6 +60,18 @@ class AggregationIssue extends AnyFlatSpec {
     computed_df.printSchema()
   }
 
+  private val foreachWriter: ForeachWriter[Row] = new ForeachWriter[Row] {
+    override def open(partitionId: Long, epochId: Long): Boolean = {
+      true
+    }
+
+    override def process(value: Row): Unit = {
+      println(value.toString)
+    }
+
+    override def close(errorOrNull: Throwable): Unit = {}
+  }
+
   "generated stream test" should "be ok" in {
 
     def generateRow(index: Int) = {
@@ -68,6 +80,7 @@ class AggregationIssue extends AnyFlatSpec {
         .parse("2020-01-01T00:00:00Z")
         .plus(Duration.ofHours(12 * (index / 2)))
       val value = (3 - 2 * group_id) * (index / 2)
+      Thread.sleep(100L) // to avoid any accelerated calls on restart
       (ts, "Group" + group_id.toString, value)
     }
 
@@ -80,20 +93,24 @@ class AggregationIssue extends AnyFlatSpec {
 
     val computed_df = df
       .withWatermark("timestamp", "1 day")
-    //      .groupBy(window($"timestamp", "1 day"), $"group")
-    //      .agg(functions.sum('value).as("agg"))
-
-    computed_df.printSchema()
+      .groupBy($"group")
+      .agg(functions.sum('value).as("agg"), functions.last('timestamp).as("ts"))
+    //      .groupBy(window($"ts", "1 day"), $"group") // not possible to over group/aggregate
+    //      .agg(functions.last('agg).as("agg_by_day"))
 
     computed_df.writeStream
       .option("truncate", value = false)
+      // .foreach(foreachWriter)
+      // .foreachBatch { (output: Dataset[_], batchId: Long) =>
+      //   println(s"Batch ID: $batchId")
+      //   output.show
+      // }
       .format("console")
-      //      .outputMode("complete")
-      .outputMode("update")
-      .option("checkpointLocation", "file_sink/checkpoints")
+      .outputMode("complete") // good doc: https://stackoverflow.com/a/48939805/12430075
+      .option("checkpointLocation", "spark.checkpoints")
       .start()
-      //            .processAllAvailable()
-      .awaitTermination(5 * 1000)
+      .processAllAvailable()
+      // .awaitTermination(20 * 1000) // the hundreds of lines error is not an error
   }
 
   "memory stream test" should "be ok" in {
@@ -107,8 +124,8 @@ class AggregationIssue extends AnyFlatSpec {
       .toDF(columns: _*)
 
     val computed_df = df
-      .groupBy(window($"timestamp", "1 day"), $"group")
-      .agg(functions.sum('value).as("agg"))
+      .groupBy($"group")
+      .agg(functions.sum('value).as("agg"), functions.max('timestamp).as("ts"))
 
     computed_df.printSchema()
 
