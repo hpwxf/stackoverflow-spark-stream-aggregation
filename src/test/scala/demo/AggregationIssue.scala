@@ -50,7 +50,7 @@ class AggregationIssue extends AnyFlatSpec {
       .withColumn(
         "cumsum",
         functions
-          .avg('value)
+          .sum('value)
           .over(event_window)
       )
       .groupBy(window($"timestamp", "1 day"), $"group")
