@@ -3,6 +3,7 @@ package demo
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.streaming.Trigger
 import org.apache.spark.sql.{Dataset, ForeachWriter, Row, SQLContext, SparkSession, functions}
 import org.scalatest.flatspec.AnyFlatSpec
 
@@ -80,15 +81,19 @@ class AggregationIssue extends AnyFlatSpec {
         .parse("2020-01-01T00:00:00Z")
         .plus(Duration.ofHours(12 * (index / 2)))
       val value = (3 - 2 * group_id) * (index / 2)
-      Thread.sleep(100L) // to avoid any accelerated calls on restart
-      (ts, "Group" + group_id.toString, value)
+//      Thread.sleep(100L) // to avoid any accelerated calls on restart
+//      if (index > 10 && group_id == 2) {
+//        Seq.empty
+//      } else {
+        Seq((ts, "Group" + group_id.toString, value))
+//      }
     }
 
     val df = spark.readStream
       .format("rate")
       .option("rowsPerSecond", 3)
       .load()
-      .flatMap(r => Seq(generateRow(r.getLong(1).toInt)))
+      .flatMap(r => generateRow(r.getLong(1).toInt))
       .toDF(columns: _*)
 
     val computed_df = df
@@ -106,8 +111,9 @@ class AggregationIssue extends AnyFlatSpec {
       //   output.show
       // }
       .format("console")
-      .outputMode("complete") // good doc: https://stackoverflow.com/a/48939805/12430075
+      .outputMode("update") // good doc: https://stackoverflow.com/a/48939805/12430075
       .option("checkpointLocation", "spark.checkpoints")
+      // .trigger(Trigger.ProcessingTime(100)) // https://spark.apache.org/docs/latest/structured-streaming-programming-guide.html#triggers
       .start()
       .processAllAvailable()
       // .awaitTermination(20 * 1000) // the hundreds of lines error is not an error
