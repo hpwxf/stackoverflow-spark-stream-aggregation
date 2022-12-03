@@ -11,6 +11,7 @@ import org.apache.spark.sql.types.{StringType, StructType, TimestampType}
 import org.scalatest.flatspec.AnyFlatSpec
 
 import java.time.{Duration, Instant}
+import scala.math.Ordered.orderingToOrdered
 import scala.util.Random
 
 /** Also note that the implementation is simplified one. This example doesn't address
@@ -60,116 +61,45 @@ class StructuredEvent extends AnyFlatSpec {
     // Accumulate value by group and report every day
     val sessionUpdates = events
       .groupByKey(event => event._1)
-      .flatMapGroupsWithState[List[SessionAcc], AggResult](
+      .flatMapGroupsWithState[IntermediateState, AggResult](
         OutputMode.Append(),
         GroupStateTimeout.EventTimeTimeout
       ) {
         case (
               group: String,
               events: Iterator[(String, Instant, Int)],
-              state: GroupState[List[SessionAcc]]
+              state: GroupState[IntermediateState]
             ) =>
-          def handleEvict(sessions: List[SessionAcc]): Iterator[AggResult] = {
-            // we sorted sessions by timestamp
-            val (evicted, kept) = sessions.span { s =>
-              s.endTime.toEpochMilli < state.getCurrentWatermarkMs()
-            }
-
-            if (kept.isEmpty) {
-              state.remove()
+          def mergeState(events: List[Event]): Iterator[AggResult] = {
+            assert(events.nonEmpty)
+            val (initial_value, initial_timestamp) = if (state.exists) {
+              (state.get.agg_value, state.get.last_timestamp)
             } else {
-              state.update(kept)
-              // trigger timeout at the end time of the first session
-              state.setTimeoutTimestamp(kept.head.endTime.toEpochMilli)
+              (0, Instant.ofEpochSecond(0))
             }
 
-            evicted.map { sessionAcc =>
-              AggResult(
-                group,
-                sessionAcc.endTime.toEpochMilli - sessionAcc.startTime.toEpochMilli,
-                sessionAcc.events.length
-              )
-            }.iterator
-          }
+            var updated_value = initial_value
+            var updated_timestamp = initial_timestamp
 
-          def mergeSessions(sessions: List[SessionAcc]): Unit = {
-            // we sorted sessions by timestamp
-            val updatedSessions = new mutable.ArrayBuffer[SessionAcc]()
-            updatedSessions ++= sessions
-
-            var curIdx = 0
-            while (curIdx < updatedSessions.length - 1) {
-              val curSession = updatedSessions(curIdx)
-              val nextSession = updatedSessions(curIdx + 1)
-
-              // Current session and next session can be merged
-              if (
-                curSession.endTime.toEpochMilli > nextSession.startTime.toEpochMilli
-              ) {
-                val accumulatedEvents =
-                  (curSession.events ++ nextSession.events).sortBy(
-                    _.startTimestamp
-                  )
-
-                val newSessions = new mutable.ArrayBuffer[SessionAcc]()
-                var eventsForCurSession =
-                  new mutable.ArrayBuffer[Event]()
-                accumulatedEvents.foreach { event =>
-                  eventsForCurSession += event
-//                  if (event.eventType == EventTypes.CLOSE_SESSION) {
-//                    newSessions += SessionAcc(eventsForCurSession.toList)
-//                    eventsForCurSession = new mutable.ArrayBuffer[Event]()
-//                  }
-                }
-                if (eventsForCurSession.nonEmpty) {
-                  newSessions += SessionAcc(eventsForCurSession.toList)
-                }
-
-                // replace current session and next session with new session(s)
-                updatedSessions.remove(curIdx + 1)
-                updatedSessions(curIdx) = newSessions.head
-                if (newSessions.length > 1) {
-                  updatedSessions.insertAll(curIdx + 1, newSessions.tail)
-                }
-
-                // move the cursor to the last new session(s)
-                curIdx += newSessions.length - 1
-              } else {
-                // move to the next session
-                curIdx += 1
-              }
+            val agg_results = events.map { e =>
+              assert(e.group == group)
+              assert(e.startTimestamp >= updated_timestamp)
+              updated_value += e.value
+              AggResult(e.group, e.startTimestamp, e.value)
             }
-
-            // update state
-            state.update(updatedSessions.toList)
+            state.update(
+              IntermediateState(group, updated_timestamp, updated_value)
+            )
+            agg_results.iterator
           }
 
           if (state.hasTimedOut && state.exists) {
-            handleEvict(state.get.sortBy(_.startTime.toEpochMilli))
+            // state.remove()
+            Iterator.empty
           } else {
-            // convert each event as individual session
-            val sessionsFromEvents = events.map {
-              case (group, timestamp, value) =>
-                val e = Event(group, timestamp, gapDuration, value)
-                SessionAcc(List(e))
-            }.toList
-            if (sessionsFromEvents.nonEmpty) {
-              val sessionsFromState = if (state.exists) {
-                state.get
-              } else {
-                List.empty
-              }
-
-              // sort sessions via start timestamp, and merge
-              mergeSessions(
-                (sessionsFromEvents ++ sessionsFromState)
-                  .sortBy(_.startTime)
-              )
-              // we still need to handle eviction here
-              handleEvict(state.get.sortBy(_.startTime))
-            } else {
-              Iterator.empty
-            }
+            mergeState(events.map { case (group, timestamp, value) =>
+              Event(group, timestamp, gapDuration, value)
+            }.toList)
           }
       }
 
@@ -202,15 +132,9 @@ object Event {
   }
 }
 
-case class SessionAcc(events: List[Event]) {
-  private val sortedEvents: List[Event] =
-    events.sortBy(_.startTimestamp)
-
-  def eventsAsSorted: List[Event] = sortedEvents
-
-  def startTime: Instant = sortedEvents.head.startTimestamp
-
-  def endTime: Instant = sortedEvents.last.endTimestamp
-}
-
-case class AggResult(id: String, durationMs: Long, numEvents: Int)
+case class IntermediateState(
+    group: String,
+    last_timestamp: Instant,
+    agg_value: Int
+)
+case class AggResult(id: String, timestamp: Instant, agg_value: Int)
