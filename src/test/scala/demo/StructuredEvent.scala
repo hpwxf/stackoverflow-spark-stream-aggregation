@@ -23,7 +23,7 @@ class StructuredEvent extends AnyFlatSpec {
   private val spark = SparkSession
     .builder()
     .master("local")
-    .appName("Spark SQL customn state management demo")
+    .appName("Spark SQL custom state management demo")
     .getOrCreate()
 
   import spark.implicits._
@@ -32,34 +32,32 @@ class StructuredEvent extends AnyFlatSpec {
 
   "session test" should "be ok" in {
 
-    def generateRow(index: Long) = {
-      // https://en.wikipedia.org/wiki/Pseudorandom_number_generator#Implementation
-      val seed = index
-      val a = seed * 15485863
-      val n = (a * a * a) % 2038074743
-      val group = index % 5
-      Seq(
-        (
-          "group" + group.toString,
-          Instant.ofEpochSecond(index * 4 + (n % 10)),
-          index.toInt
-        )
-      )
+    def generateRow(index: Int) = {
+      val group_id = (index % 2) + 1
+      val ts = Instant
+        .parse("2020-01-01T00:00:00Z")
+        .plus(Duration.ofHours(12 * (index / 2)))
+      val value = (3 - 2 * group_id) * (index / 2)
+      //      Thread.sleep(100L) // to avoid any accelerated calls on restart
+      //      if (index > 10 && group_id == 2) {
+      //        Seq.empty
+      //      } else {
+      Seq(("Group" + group_id.toString, ts, value))
+      //      }
     }
 
     val events = spark.readStream
       .format("rate")
       .option("rowsPerSecond", 1)
       .load()
-      .flatMap(r => generateRow(r.getLong(1)))
+      .flatMap(r => generateRow(r.getLong(1).toInt))
       .toDF(columns: _*)
       .withWatermark("timestamp", "10 seconds")
       .as[(String, Instant, Int)]
 
-    val gapDuration: Long = 5 * 1000 // 5 seconds
+    val gapDuration: Duration = Duration.ofHours(24)
 
-    // Sessionize the events. Track number of events, start and end timestamps of session,
-    // and report session when session is closed.
+    // Accumulate value by group and report every day
     val sessionUpdates = events
       .groupByKey(event => event._1)
       .flatMapGroupsWithState[List[SessionAcc], AggResult](
@@ -196,11 +194,10 @@ object Event {
   def apply(
       group: String,
       timestamp: Instant,
-      gapDuration: Long,
+      gapDuration: Duration,
       value: Int
   ): Event = {
-    val endTime =
-      timestamp.plus(Duration.ofMillis(gapDuration)) // FIXME should be end of the day
+    val endTime = timestamp.plus(gapDuration) // FIXME should be end of the day
     Event(group, timestamp, endTime, value)
   }
 }
