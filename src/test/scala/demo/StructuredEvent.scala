@@ -1,6 +1,8 @@
 package demo
 
-import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.{Dataset, SparkSession, functions}
+import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.streaming._
 import org.scalatest.flatspec.AnyFlatSpec
 
@@ -37,11 +39,10 @@ class StructuredEvent extends AnyFlatSpec {
       }
     }
 
-    val events = spark.readStream
-      .format("rate")
-      .option("rowsPerSecond", 1)
-      .load()
-      .flatMap(r => generateRow(r.getLong(1).toInt))
+    val inputStream =
+      new MemoryStream[(String, Instant, Int)](1, spark.sqlContext)
+    val events = inputStream
+      .toDS()
       .toDF(columns: _*)
       .withWatermark("timestamp", "0 second")
       .as[(String, Instant, Int)]
@@ -128,7 +129,7 @@ class StructuredEvent extends AnyFlatSpec {
 
     // Accumulate value by group and report every day
     // https://stackoverflow.com/questions/63917648/spark-streaming-understanding-timeout-setup-in-mapgroupswithstate
-    val sessionUpdates = events
+    val eventUpdates = events
       .groupByKey(event => event._1)
       .flatMapGroupsWithState[IntermediateState, AggResult](
         OutputMode.Append(),
@@ -136,12 +137,37 @@ class StructuredEvent extends AnyFlatSpec {
       )(processEventGroup)
 
     // Start running the query that prints the session updates to the console
-    val query = sessionUpdates.writeStream
+    val query = eventUpdates.writeStream
       .outputMode("append")
-      .format("console")
+      .foreachBatch { (ds: Dataset[_], id: Long) =>
+        println(s"Batch #$id")
+        ds.withColumn(
+          "Expected",
+          (functions.abs($"last_value") * (functions
+            .abs($"last_value") + lit(1))) / lit(2).as[Int]
+        ).show(truncate = false)
+      }
       .start()
 
-    query.awaitTermination()
+    new Thread(new Runnable() {
+      override def run(): Unit = {
+        while (!query.isActive) {}
+        var index: Int = 0
+        while (true) {
+          Thread.sleep(300L)
+          inputStream.addData(generateRow(index))
+          index += 1
+        }
+      }
+    }).start()
+
+    query.awaitTermination(40000)
+    query.recentProgress.foreach(p => {
+      println(s"\nBatch #${p.batchId} (${p.batchDuration}ms)")
+      p.stateOperators.foreach(s => {
+        println(s.toString())
+      })
+    })
   }
 }
 
