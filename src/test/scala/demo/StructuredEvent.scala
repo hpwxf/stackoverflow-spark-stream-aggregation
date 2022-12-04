@@ -1,24 +1,13 @@
 package demo
 
-import org.apache.spark.sql.execution.streaming.MemoryStream
-
-import java.sql.Timestamp
-import scala.collection.mutable
-import org.apache.spark.sql.{SQLContext, SparkSession}
-import org.apache.spark.sql.functions._
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.streaming._
-import org.apache.spark.sql.types.{StringType, StructType, TimestampType}
 import org.scalatest.flatspec.AnyFlatSpec
 
+import java.time.temporal.ChronoUnit
 import java.time.{Duration, Instant}
 import scala.math.Ordered.orderingToOrdered
-import scala.util.Random
 
-/** Also note that the implementation is simplified one. This example doesn't address
-  * - UPDATE MODE (the semantic is not clear for session window with event time processing)
-  * - partial merge (events in session which are earlier than watermark can be aggregated)
-  * - other possible optimizations
-  */
 class StructuredEvent extends AnyFlatSpec {
 
   private val spark = SparkSession
@@ -35,16 +24,17 @@ class StructuredEvent extends AnyFlatSpec {
 
     def generateRow(index: Int) = {
       val group_id = (index % 2) + 1
+      val base_value = index / 2
       val ts = Instant
         .parse("2020-01-01T00:00:00Z")
         .plus(Duration.ofHours(12 * (index / 2)))
-      val value = (3 - 2 * group_id) * (index / 2)
+      val value = (3 - 2 * group_id) * base_value
       //      Thread.sleep(100L) // to avoid any accelerated calls on restart
-      //      if (index > 10 && group_id == 2) {
-      //        Seq.empty
-      //      } else {
-      Seq(("Group" + group_id.toString, ts, value))
-      //      }
+      if (base_value > 11 && group_id == 2) {
+        Seq.empty
+      } else {
+        Seq(("Group" + group_id.toString, ts, value))
+      }
     }
 
     val events = spark.readStream
@@ -53,55 +43,97 @@ class StructuredEvent extends AnyFlatSpec {
       .load()
       .flatMap(r => generateRow(r.getLong(1).toInt))
       .toDF(columns: _*)
-      .withWatermark("timestamp", "10 seconds")
+      .withWatermark("timestamp", "0 second")
       .as[(String, Instant, Int)]
 
-    val gapDuration: Duration = Duration.ofHours(24)
+    def processEventGroup(
+        group: String,
+        events: Iterator[(String, Instant, Int)],
+        state: GroupState[IntermediateState]
+    ) = {
+      def mergeState(events: List[Event]): Iterator[AggResult] = {
+        assert(events.nonEmpty)
+
+        var (acc_value, acc_timestamp, acc_last_value) = state.getOption
+          .map(s => (s.agg_value, s.last_timestamp, s.last_value))
+          .getOrElse((0, Instant.EPOCH, 0))
+
+        val agg_results = events.flatMap { e =>
+          println(e)
+          assert(e.group == group)
+          assert(e.timestamp >= acc_timestamp) // check good data ordering
+          val intermediate_day_agg =
+            if (
+              acc_timestamp != Instant.EPOCH &&
+              e.timestamp.truncatedTo(ChronoUnit.DAYS) > acc_timestamp
+                .truncatedTo(ChronoUnit.DAYS)
+            ) {
+              Seq(
+                AggResult(
+                  group,
+                  acc_timestamp.truncatedTo(ChronoUnit.DAYS),
+                  acc_value,
+                  acc_last_value
+                )
+              )
+            } else {
+              Seq.empty
+            }
+          acc_value += e.value
+          acc_timestamp = e.timestamp
+          acc_last_value = e.value
+          intermediate_day_agg
+        }
+
+        state.setTimeoutTimestamp(
+          state.getCurrentWatermarkMs,
+          "1 day"
+        ) // or end of the last known day
+        println(
+          s"Updated state for $group will expire 1 day after current watermark is " +
+            s"${Instant.ofEpochMilli(state.getCurrentWatermarkMs())}"
+        )
+        // state.remove() // when value becomes zero
+
+        state.update(
+          IntermediateState(group, acc_timestamp, acc_value, acc_last_value)
+        )
+        agg_results.iterator
+      }
+
+      if (state.hasTimedOut && events.isEmpty) {
+        assert(state.exists)
+        println(
+          s"State for $group expired / current watermark is ${Instant
+            .ofEpochMilli(state.getCurrentWatermarkMs())}"
+        )
+        val agg_result = state.get
+        val end_of_the_day = agg_result.last_timestamp.truncatedTo(
+          ChronoUnit.DAYS
+        ) // show the beginning of the day window
+        Iterator.single(
+          AggResult(
+            group + "_",
+            end_of_the_day,
+            agg_result.agg_value,
+            agg_result.last_value
+          )
+        )
+      } else {
+        mergeState(events.map { case (group, timestamp, value) =>
+          Event(group, timestamp, value)
+        }.toList)
+      }
+    }
 
     // Accumulate value by group and report every day
+    // https://stackoverflow.com/questions/63917648/spark-streaming-understanding-timeout-setup-in-mapgroupswithstate
     val sessionUpdates = events
       .groupByKey(event => event._1)
       .flatMapGroupsWithState[IntermediateState, AggResult](
         OutputMode.Append(),
         GroupStateTimeout.EventTimeTimeout
-      ) {
-        case (
-              group: String,
-              events: Iterator[(String, Instant, Int)],
-              state: GroupState[IntermediateState]
-            ) =>
-          def mergeState(events: List[Event]): Iterator[AggResult] = {
-            assert(events.nonEmpty)
-            val (initial_value, initial_timestamp) = if (state.exists) {
-              (state.get.agg_value, state.get.last_timestamp)
-            } else {
-              (0, Instant.ofEpochSecond(0))
-            }
-
-            var updated_value = initial_value
-            var updated_timestamp = initial_timestamp
-
-            val agg_results = events.map { e =>
-              assert(e.group == group)
-              assert(e.startTimestamp >= updated_timestamp)
-              updated_value += e.value
-              AggResult(e.group, e.startTimestamp, e.value)
-            }
-            state.update(
-              IntermediateState(group, updated_timestamp, updated_value)
-            )
-            agg_results.iterator
-          }
-
-          if (state.hasTimedOut && state.exists) {
-            // state.remove()
-            Iterator.empty
-          } else {
-            mergeState(events.map { case (group, timestamp, value) =>
-              Event(group, timestamp, gapDuration, value)
-            }.toList)
-          }
-      }
+      )(processEventGroup)
 
     // Start running the query that prints the session updates to the console
     val query = sessionUpdates.writeStream
@@ -115,26 +147,21 @@ class StructuredEvent extends AnyFlatSpec {
 
 case class Event(
     group: String,
-    startTimestamp: Instant,
-    endTimestamp: Instant,
+    timestamp: Instant,
     value: Int
 )
-
-object Event {
-  def apply(
-      group: String,
-      timestamp: Instant,
-      gapDuration: Duration,
-      value: Int
-  ): Event = {
-    val endTime = timestamp.plus(gapDuration) // FIXME should be end of the day
-    Event(group, timestamp, endTime, value)
-  }
-}
 
 case class IntermediateState(
     group: String,
     last_timestamp: Instant,
-    agg_value: Int
+    agg_value: Int,
+    last_value: Int
 )
-case class AggResult(id: String, timestamp: Instant, agg_value: Int)
+
+// group is only for debugging purpose
+case class AggResult(
+    group: String,
+    timestamp: Instant,
+    agg_value: Int,
+    last_value: Int
+)
